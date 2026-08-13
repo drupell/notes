@@ -1,113 +1,31 @@
-# Installing Pi with Gondolin
+# Installing Pi with Gondolin, offline
 
-Written 2026-08-11 from the checked-out sources of `pi` (v0.84.1) and `gondolin`. Upstream moves;
-re-check against those repos if a command fails.
+Written 2026-08-12 against `pi` v0.84.1 and `gondolin` 0.12.0. Upstream moves; re-check if a
+command fails.
 
-## What this gets you
+`pi` runs on the **host**. Its built-in tools — `read`, `write`, `edit`, `bash`, `grep`,
+`find`, `ls` — and your `!` commands execute inside a local Linux micro-VM, with your project
+mounted at `/workspace` and writes passing through to the host. Provider auth stays on the
+host: **API keys never enter the VM**. That is the main reason to prefer this over running
+all of `pi` in a container.
 
-`pi` runs on the **host**. Its built-in tools — `read`, `write`, `edit`, `bash`, `grep`, `find`,
-`ls` — and your `!` commands execute inside a local Linux micro-VM. Your project directory is
-mounted at `/workspace` in the guest and writes through to the host.
-
-Provider auth stays on the host: API keys never enter the VM. That is the main reason to prefer
-this over running all of `pi` inside a container.
-
-## Requirements
+This document configures for **offline use only**. Every step below is required.
 
 | | |
 |---|---|
-| OS | macOS or Linux. **ARM64 is the best-tested path**; Linux x86_64 is CI smoke-tested |
-| Node | **>= 23.6.0** (required by `@earendil-works/gondolin`) |
-| Hypervisor | QEMU (default backend). `brew install qemu` / `sudo apt install qemu-system-arm` |
-| Disk + network | ~200MB of guest assets (kernel, initramfs, rootfs) fetched from GitHub **on first use**, cached in `~/.cache/gondolin/images/` |
+| OS | macOS or Linux. ARM64 best-tested; Linux x86_64 CI smoke-tested |
+| Node | >= 23.6.0 (required by `@earendil-works/gondolin`) |
+| Hypervisor | QEMU. `brew install qemu` / `sudo apt install qemu-system-arm` |
+| First-run download | ~200MB of guest assets from GitHub, cached in `~/.cache/gondolin/images/` |
 
-The optional `krun` backend is experimental and needs Zig + Rust toolchains (`make krun-runner` in
-the gondolin repo). Skip it unless you have a reason.
+The `krun` backend is experimental and needs Zig + Rust. Skip it.
 
 ---
 
-# Install
+## 1. Kill the phone-home, before the first run
 
-## 1. Turn everything off, before the first run
-
-**Order matters.** `enableInstallTelemetry` defaults to **true** and the install ping fires after
-the first run of a newly installed version, so this has to happen *before* you start `pi` for the
-first time. Run this whole block as-is:
-
-```bash
-#!/usr/bin/env bash
-# Force pi's telemetry, analytics and startup network operations off, persistently.
-# Safe to re-run: merges into existing settings, appends to the shell profile once.
-set -euo pipefail
-
-# ============================================================================
-# WHAT THIS TURNS OFF — edit these two blocks, the rest is plumbing.
-# ============================================================================
-
-FORCE_SETTINGS='{
-  "enableInstallTelemetry": false,
-  "enableAnalytics": false
-}'
-
-FORCE_ENV='export PI_OFFLINE=1
-export PI_TELEMETRY=0
-export PI_SKIP_VERSION_CHECK=1'
-
-# ============================================================================
-
-AGENT_DIR="${PI_AGENT_DIR:-$HOME/.pi/agent}"
-SETTINGS="$AGENT_DIR/settings.json"
-MARKER="# pi: telemetry and startup network off"
-
-mkdir -p "$AGENT_DIR"
-
-# Merge FORCE_SETTINGS over any existing settings.json, keeping your other keys.
-node -e '
-const fs = require("node:fs");
-const [file, overrides] = process.argv.slice(1);
-const existed = fs.existsSync(file);
-if (existed) fs.copyFileSync(file, file + ".bak");
-const raw = existed ? fs.readFileSync(file, "utf8").trim() : "";
-const current = raw ? JSON.parse(raw) : {};          // malformed JSON stops the script
-const merged = { ...current, ...JSON.parse(overrides) };
-fs.writeFileSync(file, JSON.stringify(merged, null, 2) + "\n");
-console.log(`${existed ? "updated" : "created"} ${file}`);
-' "$SETTINGS" "$FORCE_SETTINGS"
-
-# Append FORCE_ENV to the shell profile, once.
-case "${SHELL##*/}" in
-  zsh)  RC="$HOME/.zshrc" ;;
-  bash) RC="$HOME/.bashrc" ;;
-  *)    RC="$HOME/.profile" ;;
-esac
-
-if grep -qF "$MARKER" "$RC" 2>/dev/null; then
-  echo "already present in $RC"
-else
-  printf '\n%s\n%s\n' "$MARKER" "$FORCE_ENV" >> "$RC"
-  echo "appended to $RC"
-fi
-
-echo
-echo "Open a new shell, or: source $RC"
-```
-
-Everything it changes is in the two blocks at the top. Below that it only does three things:
-create `~/.pi/agent/` if missing, merge those settings into `settings.json` (backing up the old
-one as `settings.json.bak` and keeping every key you already had), and append those exports to
-your shell profile once, guarded by the marker comment so a re-run is a no-op.
-
-`node` is the only requirement, and you need it for pi anyway.
-
-`PI_SKIP_VERSION_CHECK` is redundant while `PI_OFFLINE=1` is set — kept explicit so the intent
-survives someone unsetting offline mode later.
-
-### Doing it by hand instead
-
-The environment variable wins over the settings file whenever it is defined at all
-(`isInstallTelemetryEnabled`, `src/core/telemetry.ts`), so the settings file is the belt and the
-exports are the braces — worth having both, since a GUI launcher or a cron job may not read your
-shell profile.
+**Order matters.** `enableInstallTelemetry` defaults to `true` and the ping fires after the
+first run of a newly installed version.
 
 ```bash
 mkdir -p ~/.pi/agent
@@ -119,38 +37,53 @@ cat > ~/.pi/agent/settings.json <<'JSON'
 JSON
 ```
 
-Note the env parser only accepts `1`/`true`/`yes` as "on"; anything else defined counts as off.
+**This overwrites `settings.json`.** If you already have one, add those two keys by hand
+instead.
 
-What each switch actually covers:
+Then add to your shell profile — `~/.zshrc`, `~/.bashrc`, or `~/.bash_profile` for bash on macOS (Terminal
+starts login shells, which do not read `~/.bashrc`):
 
-| Switch | Stops | Does **not** stop |
-|---|---|---|
-| `enableInstallTelemetry: false` / `PI_TELEMETRY=0` | the anonymous version ping to `https://pi.dev/api/report-install`, and provider attribution headers on OpenRouter / Cloudflare / direct NVIDIA NIM requests | the update check |
-| `PI_SKIP_VERSION_CHECK=1` | the `https://pi.dev/api/latest-version` fetch | telemetry, catalog refresh, package checks |
-| `PI_OFFLINE=1` | all of the startup network operations below | model traffic, tool traffic |
+```bash
+export PI_OFFLINE=1
+export PI_TELEMETRY=0
+export PI_SKIP_VERSION_CHECK=1
+```
 
-`enableAnalytics` is a separate setting and already defaults to `false`; it is only offered during
-the experimental first-run setup (`PI_EXPERIMENTAL=1`).
+Open a new shell. Both layers are worth having: the environment variable wins whenever it is
+defined at all (`isInstallTelemetryEnabled`, `src/core/telemetry.ts`), but a GUI launcher or
+cron job may not read your profile, so the settings file is the backstop.
 
-## 2. Install pi
+Set the flags to exactly `1`, `true`, or `yes`. **Never `0`** — two different offline checks
+exist in the tree, strict (`src/main.ts`, `package-manager.ts`, `tools-manager.ts`,
+`telemetry.ts`) and bare truthiness (`interactive-mode.ts`, `version-check.ts`), so `0` lands
+in a mixed state. Every site fails toward *less* network, so it is not dangerous — but it is a
+trap if you template this into a config.
+
+`PI_SKIP_VERSION_CHECK` is redundant while `PI_OFFLINE=1` is set. Keep it explicit so the
+intent survives someone unsetting offline mode later.
+
+## 2. Install the search tools first
+
+Offline mode blocks pi's `fd`/`ripgrep` downloads, but `getToolPath` checks `PATH` first — so
+a system install is used when present. Without this, the `grep` and `find` tools come back
+empty.
+
+```bash
+brew install ripgrep fd          # or: apt install ripgrep fd-find
+```
+
+## 3. Install pi
 
 ```bash
 npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+export ANTHROPIC_API_KEY=sk-ant-...   # or run `pi` and use /login
 ```
 
-`--ignore-scripts` is upstream's own recommendation — pi needs no lifecycle scripts for a normal
-npm install. The alternative installer is `curl -fsSL https://pi.dev/install.sh | sh`.
+`--ignore-scripts` is upstream's own recommendation — pi needs no lifecycle scripts.
 
-Authenticate:
+## 4. Install the Gondolin extension
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...   # or
-pi                                    # then /login and pick a provider
-```
-
-## 3. Install the Gondolin extension
-
-The extension ships **inside the pi repo**, not the gondolin one:
+It ships **inside the pi repo**, not the gondolin one:
 
 ```bash
 cp -R packages/coding-agent/examples/extensions/gondolin ~/.pi/agent/extensions/gondolin
@@ -158,236 +91,137 @@ cd ~/.pi/agent/extensions/gondolin
 npm install --ignore-scripts
 ```
 
-That pulls `@earendil-works/gondolin` (pinned to `0.12.0` by the extension's `package.json`).
+That `cp -R` is what turns it on — permanently, for every project, no alias and no `-e` flag.
+`~/.pi/agent/extensions/` is auto-discovered.
 
-If you only have the gondolin checkout, its `host/examples/pi-gondolin.ts` is an older, thinner
-variant — it overrides `read`/`write`/`edit`/`bash` only and wants `pnpm install` in the gondolin
-repo first so imports resolve. Prefer pi's copy.
+To make it deliberate instead: `mv ~/.pi/agent/extensions/gondolin ~/.pi/gondolin` and run
+`pi -e ~/.pi/gondolin` when you want it.
 
-## 4. Run it
+## 5. Close the guest's egress
 
-```bash
-cd /path/to/project
-pi
-```
+**The bundled extension ships with no egress policy.** It calls `VM.create` with a filesystem
+mount and no `httpHooks`, and `createHttpHooks` treats an omitted `allowedHosts` as `["*"]`
+(`host/src/http/hooks.ts`). Out of the box you get process and filesystem isolation, **no
+destination allowlist**.
 
-The VM starts eagerly on `session_start`, so a missing QEMU surfaces immediately rather than on
-the first tool call. You should see a status line reporting the mount, and the model's system
-prompt has its working directory rewritten to `/workspace`.
-
-Sanity check inside a session: ask it to run `uname -a` and `ls /`. You should get an Alpine
-guest, not your host.
-
-## Is the extension used by default?
-
-**Yes — the `cp -R` in step 3 is what turns it on, permanently and for every project.** No alias
-needed, and `-e` is redundant.
-
-`~/.pi/agent/extensions/` is an auto-discovered global location. The loader walks project-local
-`.pi/extensions/`, then `~/.pi/agent/extensions/`, then anything named explicitly, deduplicating
-by resolved path — so `pi -e ~/.pi/agent/extensions/gondolin` loads exactly the same thing as bare
-`pi`. The `-e` form in upstream's own docs is just being explicit.
-
-| Location | Scope |
-|---|---|
-| `~/.pi/agent/extensions/*.ts` | global, every project |
-| `~/.pi/agent/extensions/*/index.ts` | global, every project (this is where the `cp -R` puts it) |
-| `.pi/extensions/*.ts`, `.pi/extensions/*/index.ts` | project-local, **loaded only after the project is trusted** |
-| `settings.json` → `"extensions": ["/abs/path"]` | explicit paths, any location |
-
-Auto-discovered extensions also hot-reload with `/reload`; `-e` paths are meant for quick tests.
-
-### If you'd rather it be opt-in
-
-Always-on means *every* project runs its tools inside Alpine — a slower session start, and a guest
-toolchain that may not have what a given project needs. To keep it deliberate, put the extension
-somewhere that is not auto-discovered and name it when you want it:
-
-```bash
-mv ~/.pi/agent/extensions/gondolin ~/.pi/gondolin
-alias pisafe='pi -e ~/.pi/gondolin'      # or just type the -e when you want it
-```
-
-Per-project instead: copy it to `<project>/.pi/extensions/gondolin` and trust the project once.
-Note that project-local extensions load only after the trust decision, so the VM starts slightly
-later in the boot sequence.
-
----
-
-# Offline mode
-
-## Making it the default
-
-There is no `settings.json` key for offline mode — it is a flag or an environment variable only:
-
-```bash
-export PI_OFFLINE=1        # in your shell profile
-```
-
-Prefer the variable over `alias pi='pi --offline'`: an alias does not apply in scripts or
-non-interactive shells, and anything that spawns `pi` on your behalf misses it. The two are
-equivalent at startup — `pi` reads either, and when set it writes both `PI_OFFLINE=1` and
-`PI_SKIP_VERSION_CHECK=1` back into the process environment, so child processes inherit them.
-
-**Set it to exactly `1`, `true`, or `yes`.** Never `0` — see the parsing trap below.
-
-## What offline mode prevents
-
-All of these are **startup** operations:
-
-| Operation | Endpoint |
-|---|---|
-| Model catalog refresh | pi.dev per-provider overlays, cached to `~/.pi/agent/models-store.json`. 15s abort timeout |
-| Version check | `https://pi.dev/api/latest-version` |
-| Install/update telemetry | `https://pi.dev/api/report-install?version=…` |
-| Package update checks | npm registry / git remotes for pi packages |
-| Managed tool downloads | `api.github.com/repos/sharkdp/fd` and `BurntSushi/ripgrep` releases, then the release asset from `github.com`. 10s network / 120s download timeout |
-
-Offline mode also makes the catalog cache authoritative: pi keeps using whatever is already in
-`models-store.json` rather than refreshing it, which is the intended behaviour for a machine that
-cannot reach pi.dev.
-
-**One thing to install yourself.** Offline mode blocks the `fd` and `ripgrep` downloads, and pi
-prints `not found. Offline mode enabled, skipping download.` But `getToolPath` checks your `PATH`
-before it considers downloading, so a system install is used if present:
-
-```bash
-brew install ripgrep fd          # or: apt install ripgrep fd-find
-```
-
-Worth doing before you flip offline mode on, or the `grep` and `find` tools come back empty.
-
-## What it does not prevent
-
-- **Model provider API calls.** The agent's actual traffic is untouched — offline mode is about
-  startup chores, not inference.
-- **Anything a tool does.** `bash`, `curl`, a `npm install` the model decides to run.
-- **MCP servers and extensions**, which run with the pi process's permissions.
-- **Gondolin's own first-use fetch.** The ~200MB of guest assets comes from a GitHub-hosted
-  registry and pi's flag has no bearing on it. To avoid it, pre-populate the cache or point
-  Gondolin at local assets:
-
-  ```bash
-  export GONDOLIN_GUEST_DIR=/path/to/assets        # use these instead of downloading
-  export GONDOLIN_IMAGE_STORE=/path/to/image/store # default ~/.cache/gondolin/images
-  export GONDOLIN_IMAGE_REGISTRY_URL=...           # default: raw.githubusercontent.com/earendil-works/gondolin
-  ```
-
-So `PI_OFFLINE=1` is a "do not phone home on boot" switch, not a network boundary. A real boundary
-has to come from outside the process — which is the conclusion pi's own `docs/security.md`
-reaches too.
-
-## The parsing trap
-
-Two different offline checks exist in the tree:
-
-- **Strict** (`1`/`true`/`yes` only): `main.ts:113`, `package-manager.ts:43`,
-  `tools-manager.ts:15`, `telemetry.ts:3`
-- **Bare truthiness** (`if (process.env.PI_OFFLINE)`): `interactive-mode.ts:1015,1106,1202`,
-  `version-check.ts:55`
-
-`PI_OFFLINE=0` therefore lands in a mixed state: catalog refresh, version check and package-update
-check are skipped because a non-empty string is truthy, while the package manager and managed-tool
-downloads still reach the network because they parse the value properly. Every site individually
-fails toward *less* network, so it is not dangerous — but "0" meaning "partially on" is a trap if
-you ever template this into a config.
-
----
-
-# Sandbox posture out of the box
-
-The bundled extension calls `VM.create` with a filesystem mount and **no `httpHooks`**. Two
-consequences, both in the source:
-
-- The egress policy hooks (`isRequestAllowed`, `isIpAllowed`, `onRequest`, `onResponse`) are only
-  consulted when hooks are configured — `host/src/qemu/http.ts` early-returns without them.
-- `createHttpHooks` treats an omitted `allowedHosts` as `["*"]` (`host/src/http/hooks.ts:162`).
-
-So the default is **process and filesystem isolation, no destination allowlist, no secret
-injection**. The parts of Gondolin that make it interesting for egress control are opt-in. To get
-them, build hooks and pass them to `VM.create` in the extension's `index.ts`:
+Edit the extension's `index.ts`:
 
 ```ts
 import { createHttpHooks } from "@earendil-works/gondolin";
 
 const { httpHooks, env } = createHttpHooks({
-  allowedHosts: ["api.github.com", "*.crates.io"],
-  secrets: {
-    GITHUB_TOKEN: { hosts: ["api.github.com"], value: process.env.GITHUB_TOKEN! },
-  },
+  allowedHosts: [],            // [] denies everything; omitting the key allows everything
   // blockInternalRanges defaults to true
 });
 
 const created = await VM.create({ httpHooks, env, vfs: { /* existing mounts */ } });
 ```
 
-Secret injection gives the guest a **placeholder**; the host substitutes the real value into
-headers only for allowlisted destinations. It relies on TLS interception — Gondolin generates a
-local CA under `~/.cache/gondolin/ssl` and injects it into the guest — so anything doing
-certificate pinning inside the VM will break.
+An empty array is not the same as leaving the option out. Check this after every extension
+update.
 
-# Limitations that will actually bite
+## 6. Get the guest assets on the machine
 
-From gondolin's `docs/limitations.md`:
+The guest is three files — a kernel, an initramfs, and a rootfs — totalling ~200MB. Gondolin
+fetches them from a GitHub-hosted registry on first use. **`PI_OFFLINE` does not cover this**;
+it is pi's flag and has no bearing on Gondolin.
 
-- **No HTTP/2, HTTP/3, or QUIC.** Mediation is HTTP/1.x and TLS-over-TCP. UDP-based application
-  protocols and WebRTC do not work in the default network model.
-- **Alpine only**, and the default image is deliberately minimal. Extra compilers or language
-  runtimes mean building a custom guest image (`docs/custom-images.md`).
-- **No full VM save/restore.** Disk-only qcow2 checkpoints exist; in-VM process state and RAM are
-  not captured. `/root`, `/tmp`, `/var/tmp`, `/var/cache`, `/var/log` are tmpfs-backed and are not
-  part of a checkpoint.
-- **Backend parity gaps** between `qemu` and `krun`; qemu-specific knobs are rejected under krun.
+**If this machine has network:** just run `pi` once (step 7). They download to
+`~/.cache/gondolin/images/` and are reused forever after. Nothing to configure.
 
-Explicit non-goals in gondolin's `docs/security.md`: a malicious host, a malicious local user on
-the same account, VM escape through a QEMU bug, side channels, and denial of service. The host
-Node process is trusted.
+**If it does not:** copy them from a machine that does — same CPU architecture, since the
+assets are per-arch. On the networked machine, run `pi` once, then find them:
 
-# Porting model providers from opencode
+```bash
+ls ~/.cache/gondolin/images/objects/*/
+# vmlinuz-virt  initramfs.cpio.lz4  rootfs.ext4  [manifest.json]
+```
 
-There is no importer in pi — I checked; `opencode` appears in its source only as the names of the
-Zen and Go *gateways*, which pi supports natively (`OPENCODE_API_KEY`, provider ids `opencode` and
-`opencode-go`). Everything else is a manual translation between two config shapes:
+That object directory is the whole guest. Copy it to the offline machine at a **stable path
+outside any cache**, then point Gondolin at it:
 
-| opencode (`opencode.json`) | pi (`~/.pi/agent/models.json`) |
+```bash
+mkdir -p ~/gondolin-assets
+# copy the contents of that objects/<id>/ directory into ~/gondolin-assets
+export GONDOLIN_GUEST_DIR=~/gondolin-assets      # add to your shell profile
+```
+
+`GONDOLIN_GUEST_DIR` is a hard override, first in the lookup order (`host/src/assets.ts`) — set
+it and the registry is never consulted. Gondolin checks for exactly those three filenames; a
+`manifest.json` in the directory renames them, so copy it too if one is present.
+
+Do not use `GONDOLIN_IMAGE_STORE` for this. It relocates the download cache, it does not avoid
+downloading — on an air-gapped box it gives you an empty directory and a failed fetch.
+
+Get it working online before pinning the variable. Pinning a path you have never booted from
+means debugging the VM and the asset path at the same time.
+
+## 7. Run
+
+```bash
+cd /path/to/project && pi
+```
+
+The VM starts eagerly on `session_start`, so a missing QEMU surfaces immediately rather than
+on the first tool call. Sanity check inside a session: ask it to run `uname -a` and `ls /`.
+You should get an Alpine guest, not your host.
+
+---
+
+## What offline mode does and does not cover
+
+`PI_OFFLINE=1` is a "do not phone home on boot" switch, not a network boundary.
+
+| Stopped (all at startup) | Endpoint |
+|---|---|
+| Model catalog refresh | pi.dev overlays → `~/.pi/agent/models-store.json` |
+| Version check | `pi.dev/api/latest-version` |
+| Install telemetry | `pi.dev/api/report-install` |
+| Package update checks | npm registry / git remotes |
+| Managed tool downloads | `api.github.com` (fd, ripgrep) then the release asset |
+
+**Not stopped:** model provider API calls (the agent's actual traffic), anything a tool does
+(`bash`, `curl`, an `npm install` the model runs), MCP servers and extensions — which run with
+the pi process's permissions — and Gondolin's guest-asset fetch.
+
+Offline mode also makes the catalog cache authoritative: pi keeps using whatever is already in
+`models-store.json`.
+
+**A real boundary has to come from outside the process** — a host firewall rule, or a network
+namespace with no route. This is the conclusion pi's own `docs/security.md` reaches too.
+Gondolin's explicit non-goals: a malicious host, a malicious local user on the same account, VM
+escape through a QEMU bug, side channels, denial of service. The host Node process is trusted.
+
+## Limitations that will actually bite
+
+- **No HTTP/2, HTTP/3, or QUIC.** Mediation is HTTP/1.x and TLS-over-TCP. UDP-based protocols
+  and WebRTC do not work.
+- **Alpine only**, deliberately minimal. Extra compilers or language runtimes mean a custom
+  guest image (`docs/custom-images.md`).
+- **Anything on the host is invisible to the guest.** Only the project directory is mounted, so
+  a globally installed CLI the model expects to call will not be there.
+- **No full VM save/restore.** Disk-only qcow2 checkpoints; RAM and process state are not
+  captured, and `/root`, `/tmp`, `/var/tmp`, `/var/cache`, `/var/log` are tmpfs-backed.
+
+## Porting model providers from opencode
+
+There is no importer in pi — `opencode` appears in its source only as the names of the Zen and
+Go *gateways*, which pi supports natively (`OPENCODE_API_KEY`, provider ids `opencode` and
+`opencode-go`). Everything else is a manual translation into `~/.pi/agent/models.json`:
+
+| opencode (`opencode.json`) | pi (`models.json`) |
 |---|---|
 | `provider.<id>.options.baseURL` / `.endpoint` | `baseUrl` |
 | `provider.<id>.npm` | `api` — `@ai-sdk/openai-compatible` → `openai-completions`, `@ai-sdk/anthropic` → `anthropic-messages`, `@ai-sdk/google` → `google-generative-ai` |
-| `options.apiKey` | `apiKey` |
-| `options.headers` | `headers` |
+| `options.apiKey` / `options.headers` | `apiKey` / `headers` |
 | `models.<id>` (`name`, `reasoning`, `limit.context`, `limit.output`) | `models[]` (`id`, `name`, `reasoning`, `contextWindow`, `maxTokens`) |
 | `{env:VAR}` | `$VAR` |
-| `{file:path}` | `!cat path` — **note the semantic change**: pi runs the command on every request, opencode read the file once at startup |
+| `{file:path}` | `!cat path` — **pi runs the command on every request**; opencode read the file once at startup |
 | `blacklist` / `whitelist` | no equivalent |
 | `mcp` | **nothing.** pi has no MCP support by design |
 
-`pi-import-opencode.mjs` in this directory does the mechanical part:
-
-```bash
-node pi-import-opencode.mjs ~/.config/opencode/opencode.json           # preview, writes nothing
-node pi-import-opencode.mjs ~/.config/opencode/opencode.json --write   # merge into models.json
-```
-
-## Why you can trust that script
-
-Read it before running it — it is ~230 lines and the whole translation lives in two tables at the
-top. Concretely:
-
-- **It previews by default.** Without `--write` it prints the proposed JSON and exits. With
-  `--write` it backs the old file up to `models.json.bak` and merges, so providers it did not
-  import survive.
-- **It cannot reach the network, and you can prove it in one command:**
-  `grep -nE "fetch|http|child_process|exec|spawn|import " pi-import-opencode.mjs` returns exactly
-  two lines, `node:fs` and `node:path`. No dependencies, so there is no transitive code either.
-- **It never copies or prints a secret.** `{env:VAR}` references move across as references.
-  Literal keys are replaced with `$PI_<PROVIDER>_API_KEY` and reported **by variable name only**,
-  with a pointer back to the field in your opencode file — so the output is safe to paste
-  somewhere, and you move the actual value by hand.
-- **It reports rather than drops.** Any provider option it does not understand, any unknown npm
-  package, any out-of-scope section is listed under "NOT converted". A TLS or proxy setting you
-  depend on surfaces there instead of vanishing.
-- **It declines to guess.** Per-model `cost` is not translated, because the two formats' units
-  were not verified — a wrong price is worse than a missing one.
+Per-model `cost` has no verified unit mapping between the two formats — set it by hand or leave
+it out.
 
 ## TLS and custom CAs
 
@@ -398,18 +232,22 @@ processes, so it is Node's lever:
 export NODE_EXTRA_CA_CERTS=/path/to/corp-ca.pem
 ```
 
-That covers a corporate TLS-inspecting proxy in front of your model endpoint. Client-certificate
-(mTLS) auth is not expressible in either config file — it needs a pi extension registering a
-provider with its own fetch, per `docs/custom-provider.md`.
+That covers a TLS-inspecting proxy in front of your model endpoint. Client-certificate (mTLS)
+auth is not expressible in either config file — it needs a pi extension registering a provider
+with its own fetch (`docs/custom-provider.md`).
 
-# Sources
+Note this interacts with Gondolin: secret injection and the egress allowlist rely on TLS
+interception, with a local CA generated under `~/.cache/gondolin/ssl` and injected into the
+guest. Anything doing certificate pinning inside the VM will break.
+
+## Sources
 
 | Claim | Where |
 |---|---|
-| Install steps, requirements, tool list | pi `packages/coding-agent/docs/containerization.md` |
-| pi install, auth, telemetry and update checks | pi `packages/coding-agent/README.md`, `docs/settings.md`, `docs/environment-variables.md` |
+| Install steps, requirements, tool list | pi `docs/containerization.md` |
+| Telemetry, settings, update checks | pi `README.md`, `docs/settings.md`, `docs/environment-variables.md` |
 | Offline behaviour and flag parsing | pi `src/main.ts`, `src/core/telemetry.ts`, `src/core/package-manager.ts`, `src/utils/tools-manager.ts`, `src/utils/version-check.ts`, `src/modes/interactive/interactive-mode.ts` |
-| Extension source, pinned gondolin version | pi `packages/coding-agent/examples/extensions/gondolin/` |
-| Network model, defaults, hooks | gondolin `docs/network.md`, `docs/sdk-network.md`, `host/src/http/hooks.ts` |
+| Extension source, pinned gondolin version | pi `examples/extensions/gondolin/` |
+| Network model, hook defaults | gondolin `docs/network.md`, `docs/sdk-network.md`, `host/src/http/hooks.ts` |
 | Guest assets, cache paths, env vars | gondolin `docs/cli.md`, `docs/snapshots.md` |
 | Limitations, security non-goals | gondolin `docs/limitations.md`, `docs/security.md` |
